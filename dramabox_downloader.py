@@ -17,13 +17,13 @@ if sys.stdout.encoding != 'utf-8':
         pass
         
 # --- KONFIGURASI ---
-HISTORY_FILE = "download_history.xlsx"
 # --- KONFIGURASI ---
 from dotenv import load_dotenv
 
 load_dotenv()
 # --- KONFIGURASI ---
-HISTORY_FILE = "download_history.xlsx"
+script_dir = os.path.dirname(os.path.abspath(__file__))
+HISTORY_FILE = os.path.join(script_dir, "download_history.xlsx")
 BASE_DOWNLOAD_API = "https://streamapi.web.id/api-dramabox/drama.php"
 BASE_HOME_API = "https://streamapi.web.id/api-dramabox/index.php"
 MAX_WORKERS = 5 # Jumlah thread download bersamaan (Parallel)
@@ -198,8 +198,8 @@ def process_book_parallel(book_data):
     book_name = book_info.get("bookName", book_info.get("title", "Unknown"))
     total_chapters = len(chapters)
 
-    # 2. Folder Setup (Current Directory)
-    current_dir = os.getcwd()
+    # 2. Folder Setup (Relative to Script Directory)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
     target_folder = os.path.join(current_dir, real_book_id)
     
     if not os.path.exists(target_folder):
@@ -466,7 +466,9 @@ def download_specific_chapter():
     cover_url = target_chapter.get("cover")
     
     # Buat folder manual
-    folder_name = f"downloads_{book_id}_manual"
+    # Buat folder manual (Relative to Script Directory)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    folder_name = os.path.join(script_dir, f"downloads_{book_id}_manual")
     if not os.path.exists(folder_name): os.makedirs(folder_name)
     
     print(f"\nFolder: '{folder_name}'")
