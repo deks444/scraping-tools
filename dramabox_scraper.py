@@ -14,6 +14,7 @@ class DramaboxScraper:
         self.api_key = api_key or os.getenv("DRAMABOX_API_KEY")
         self.base_url = "https://streamapi.web.id/api-dramabox/"
         self.history_file = "download_history.json"
+        self.master_excel = "dramabox_master_list.xlsx"
         self.download_dir = "downloads"
         self.history = self._load_history()
         
@@ -51,9 +52,11 @@ class DramaboxScraper:
             print(f"Request failed: {e}")
         return None
 
-    def get_drama_list(self, page: int = 1, page_size: int = 20, lang: str = "in") -> List[Dict[str, Any]]:
+    def get_drama_list(self, page: int = 1, page_size: int = 20, lang: str = "in") -> tuple[List[Dict[str, Any]], bool]:
         data = self._get("new", {"page": page, "pageSize": page_size, "lang": lang})
-        return data.get('list', []) if data else []
+        if data:
+            return data.get('list', []), data.get('isMore', False)
+        return [], False
 
     def get_drama_detail(self, drama_id: str, lang: str = "in") -> Optional[Dict[str, Any]]:
         return self._get("drama", {"id": drama_id, "lang": lang})
@@ -82,10 +85,52 @@ class DramaboxScraper:
             print(f"Download failed for {url}: {e}")
             return False
 
-    def save_to_excel(self, dramas: List[Dict[str, Any]], filename: str = "dramabox_data.xlsx"):
+    def save_to_excel(self, dramas: List[Dict[str, Any]], filename: str = None):
+        filename = filename or self.master_excel
         df = pd.DataFrame(dramas)
         df.to_excel(filename, index=False)
-        print(f"Metadata saved to {filename}")
+        print(f"Data saved to {filename}")
+
+    def update_master_excel(self, drama_info: Dict[str, Any]):
+        """Update a single drama record in the master excel file."""
+        df = None
+        if os.path.exists(self.master_excel):
+            try:
+                df = pd.read_excel(self.master_excel)
+            except:
+                pass
+        
+        if df is None:
+            df = pd.DataFrame(columns=["ID", "Title", "Episodes Downloaded", "Total Episodes (API)", "Last Updated"])
+
+        # Ensure ID is string for comparison
+        df['ID'] = df['ID'].astype(str)
+        drama_id = str(drama_info['ID'])
+        
+        # Check if exists
+        mask = df['ID'] == drama_id
+        if mask.any():
+            for key, value in drama_info.items():
+                if key in df.columns:
+                    df.loc[mask, key] = value
+            df.loc[mask, "Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            new_row = drama_info.copy()
+            new_row["Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+        df.to_excel(self.master_excel, index=False)
+
+    def get_excel_history(self) -> Dict[str, int]:
+        """Returns a mapping of Drama ID to Episodes Downloaded from Excel."""
+        if not os.path.exists(self.master_excel):
+            return {}
+        try:
+            df = pd.read_excel(self.master_excel)
+            df['ID'] = df['ID'].astype(str)
+            return dict(zip(df['ID'], df['Episodes Downloaded']))
+        except:
+            return {}
 
     def download_drama(self, drama_id: str, lang: str = "in", only_new: bool = False):
         detail = self.get_drama_detail(drama_id, lang)
@@ -103,9 +148,17 @@ class DramaboxScraper:
             self.download_file(detail['cover'], drama_folder, "cover.jpg")
 
         episodes = detail.get('chapterList', [])
-        print(f"Found {len(episodes)} episodes for '{drama_name}'")
+        total_episodes = len(episodes)
+        print(f"Found {total_episodes} episodes for '{drama_name}'")
 
         new_episodes_found = False
+        downloaded_count = 0
+        
+        # Count existing files first to be accurate
+        for f in os.listdir(drama_folder):
+            if f.startswith("episode_") and f.endswith(".mp4"):
+                downloaded_count += 1
+
         for ep in episodes:
             ep_index = ep['chapterIndex']
             ep_id = ep['chapterId']
@@ -119,9 +172,18 @@ class DramaboxScraper:
                 success = self.download_file(watch_info['videoUrl'], drama_folder, filename)
                 if success:
                     new_episodes_found = True
+                    downloaded_count += 1
                     if ep_id not in self.history['downloaded_episode_ids']:
                         self.history['downloaded_episode_ids'].append(ep_id)
         
+        # Update Master Excel
+        self.update_master_excel({
+            "ID": drama_id,
+            "Title": detail['bookName'],
+            "Episodes Downloaded": downloaded_count,
+            "Total Episodes (API)": total_episodes
+        })
+
         if new_episodes_found or drama_id not in self.history['downloaded_drama_ids']:
             if drama_id not in self.history['downloaded_drama_ids']:
                 self.history['downloaded_drama_ids'].append(drama_id)
@@ -129,31 +191,34 @@ class DramaboxScraper:
         else:
             print(f"No new episodes for '{drama_name}'")
 
-    def download_all(self, max_pages: int = 5, lang: str = "in", only_new: bool = False):
-        all_dramas_metadata = []
-        for page in range(1, max_pages + 1):
+    def download_all(self, lang: str = "in", only_new: bool = False):
+        excel_history = self.get_excel_history() if only_new else {}
+        page = 1
+        has_more = True
+        
+        while has_more:
             print(f"Fetching page {page}...")
-            dramas = self.get_drama_list(page=page, lang=lang)
+            dramas, has_more = self.get_drama_list(page=page, lang=lang)
             if not dramas:
                 break
             
             for drama in dramas:
-                drama_id = drama['bookId']
+                drama_id = str(drama['bookId'])
+                api_ep_count = drama['chapterCount']
                 
-                # Collect metadata for Excel
-                all_dramas_metadata.append({
-                    "ID": drama['bookId'],
-                    "Title": drama['bookName'],
-                    "Introduction": drama['introduction'],
-                    "Episodes": drama['chapterCount'],
-                    "Tags": ", ".join(drama['tags']),
-                    "Cover URL": drama['cover']
-                })
+                if only_new and drama_id in excel_history:
+                    downloaded_so_far = excel_history[drama_id]
+                    if api_ep_count <= downloaded_so_far:
+                        print(f"Skipping '{drama['bookName']}' (Already up to date: {downloaded_so_far} eps)")
+                        continue
+                    else:
+                        print(f"Update found for '{drama['bookName']}': {downloaded_so_far} -> {api_ep_count} eps")
 
                 print(f"Processing Drama: {drama['bookName']}")
                 self.download_drama(drama_id, lang, only_new=only_new)
-
-        self.save_to_excel(all_dramas_metadata)
+            
+            page += 1
+        print("Download process finished.")
 
     def download_single_episode(self, drama_id: str, episode_index: int, lang: str = "in"):
         detail = self.get_drama_detail(drama_id, lang)
@@ -177,17 +242,16 @@ class DramaboxScraper:
                     self.history['downloaded_episode_ids'].append(ep_id)
                     self._save_history()
 
-    def sync_local_folders(self, excel_filename: str = "downloaded_folders.xlsx"):
+    def sync_local_folders(self):
+        """Scan folders and update the master excel file."""
         print(f"Scanning folder: {self.download_dir}...")
         if not os.path.exists(self.download_dir):
             print("Download folder not found.")
             return
 
-        items = []
         folders = [f for f in os.listdir(self.download_dir) if os.path.isdir(os.path.join(self.download_dir, f))]
         
         for folder_name in folders:
-            # Format: [ID]_[Name]
             if "_" in folder_name:
                 parts = folder_name.split("_", 1)
                 drama_id = parts[0]
@@ -196,30 +260,24 @@ class DramaboxScraper:
                 drama_id = "Unknown"
                 drama_title = folder_name
             
-            # Count episodes (mp4 files)
+            if drama_id == "Unknown": continue
+
             folder_path = os.path.join(self.download_dir, folder_name)
             ep_count = len([f for f in os.listdir(folder_path) if f.endswith(".mp4")])
             
-            items.append({
-                "Drama ID": drama_id,
-                "Folder Name": folder_name,
+            # Update Master Excel from local scan
+            self.update_master_excel({
+                "ID": drama_id,
                 "Title": drama_title,
-                "Episode Count": ep_count,
-                "Last Sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "Episodes Downloaded": ep_count,
+                "Total Episodes (API)": ep_count # We don't know API count from local scan
             })
             
-            # Sync to internal history if not already there
-            if drama_id != "Unknown" and drama_id not in self.history['downloaded_drama_ids']:
+            if drama_id not in self.history['downloaded_drama_ids']:
                 self.history['downloaded_drama_ids'].append(drama_id)
 
         self._save_history()
-        
-        if items:
-            df = pd.DataFrame(items)
-            df.to_excel(excel_filename, index=False)
-            print(f"Sync complete. {len(items)} folders recorded in {excel_filename}")
-        else:
-            print("No folders found to sync.")
+        print(f"Sync complete. Check {self.master_excel}")
 
 def main():
     scraper = DramaboxScraper()
@@ -236,9 +294,7 @@ def main():
         choice = input("Enter choice (1-6): ")
         
         if choice == '1':
-            pages = input("Enter max pages to scrape (default 5): ")
-            max_pages = int(pages) if pages.isdigit() else 5
-            scraper.download_all(max_pages=max_pages)
+            scraper.download_all()
         elif choice == '2':
             drama_id = input("Enter Drama ID: ")
             scraper.download_drama(drama_id)
@@ -248,9 +304,7 @@ def main():
             if ep_idx.isdigit():
                 scraper.download_single_episode(drama_id, int(ep_idx))
         elif choice == '4':
-            pages = input("Enter max pages to check (default 5): ")
-            max_pages = int(pages) if pages.isdigit() else 5
-            scraper.download_all(max_pages=max_pages, only_new=True)
+            scraper.download_all(only_new=True)
         elif choice == '5':
             scraper.sync_local_folders()
         elif choice == '6':
