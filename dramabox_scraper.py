@@ -100,8 +100,13 @@ class DramaboxScraper:
             except:
                 pass
         
+        required_columns = ["ID", "Title", "Introduction", "Tags", "Episodes Downloaded", "Total Episodes (API)", "Last Updated"]
         if df is None:
-            df = pd.DataFrame(columns=["ID", "Title", "Episodes Downloaded", "Total Episodes (API)", "Last Updated"])
+            df = pd.DataFrame(columns=required_columns)
+        else:
+            for col in required_columns:
+                if col not in df.columns:
+                    df[col] = "" # Add missing column
 
         # Ensure ID is string for comparison
         df['ID'] = df['ID'].astype(str)
@@ -177,9 +182,14 @@ class DramaboxScraper:
                         self.history['downloaded_episode_ids'].append(ep_id)
         
         # Update Master Excel
+        tags = detail.get('tags', [])
+        tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+        
         self.update_master_excel({
             "ID": drama_id,
-            "Title": detail['bookName'],
+            "Title": detail.get('bookName', ''),
+            "Introduction": detail.get('introduction', detail.get('bookIntroduction', '')),
+            "Tags": tags_str,
             "Episodes Downloaded": downloaded_count,
             "Total Episodes (API)": total_episodes
         })
@@ -279,6 +289,104 @@ class DramaboxScraper:
         self._save_history()
         print(f"Sync complete. Check {self.master_excel}")
 
+    def export_drama_to_excel_with_urls(self, drama_id: str, lang: str = "in"):
+        """Fetch drama metadata and all episode URLs, then export to a separate Excel file."""
+        print(f"Fetching details for Drama ID: {drama_id}...")
+        detail = self.get_drama_detail(drama_id, lang)
+        if not detail:
+            print(f"Failed to get details for Drama ID: {drama_id}")
+            return
+        
+        drama_name = detail.get('bookName', f'Drama_{drama_id}')
+        episodes = detail.get('chapterList', [])
+        tags = detail.get('tags', [])
+        tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+        intro = detail.get('introduction', detail.get('bookIntroduction', ''))
+        
+        data_list = []
+        print(f"Fetching video URLs for {len(episodes)} episodes... This may take a moment.")
+        
+        for ep in episodes:
+            ep_index = ep['chapterIndex']
+            print(f"  Fetching URL for Episode {ep_index + 1}/{len(episodes)}...", end='\r')
+            watch_info = self.get_watch_info(drama_id, ep_index, lang)
+            
+            data_list.append({
+                "Drama ID": drama_id,
+                "Drama Title": drama_name,
+                "Introduction": intro,
+                "Tags": tags_str,
+                "Episode Index": ep_index + 1,
+                "Episode Title": ep.get('chapterName', f'Episode {ep_index + 1}'),
+                "Video URL": watch_info.get('videoUrl', 'Not Found') if watch_info else 'Error'
+            })
+        
+        print(f"\nFetched {len(data_list)} episode URLs.")
+        
+        # Save to a specific file for this drama
+        safe_name = "".join(x for x in drama_name if x.isalnum() or x in " -_").strip()
+        export_filename = f"drama_info_{drama_id}_{safe_name}.xlsx"
+        
+        df = pd.DataFrame(data_list)
+        df.to_excel(export_filename, index=False)
+        print(f"Detailed drama info with URLs saved to: {export_filename}")
+
+    def export_all_dramas_to_excel_with_urls(self, lang: str = "in"):
+        """Iterate through all pages and export every drama's info and episode URLs to one Excel."""
+        page = 1
+        has_more = True
+        all_data_list = []
+        
+        print("Starting global export of all dramas with video URLs...")
+        
+        while has_more:
+            print(f"\n--- Fetching Page {page} ---")
+            dramas, has_more = self.get_drama_list(page=page, lang=lang)
+            if not dramas:
+                break
+            
+            for drama in dramas:
+                drama_id = str(drama['bookId'])
+                print(f"Processing Drama: {drama['bookName']} (ID: {drama_id})")
+                
+                detail = self.get_drama_detail(drama_id, lang)
+                if not detail:
+                    print(f"  Skipping ID {drama_id}: Could not fetch details.")
+                    continue
+                
+                episodes = detail.get('chapterList', [])
+                tags = detail.get('tags', [])
+                tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+                intro = detail.get('introduction', detail.get('bookIntroduction', ''))
+                
+                for ep in episodes:
+                    ep_index = ep['chapterIndex']
+                    print(f"    Fetching URL for Episode {ep_index + 1}/{len(episodes)}...", end='\r')
+                    watch_info = self.get_watch_info(drama_id, ep_index, lang)
+                    
+                    all_data_list.append({
+                        "Drama ID": drama_id,
+                        "Drama Title": detail.get('bookName', ''),
+                        "Introduction": intro,
+                        "Tags": tags_str,
+                        "Episode Index": ep_index + 1,
+                        "Episode Title": ep.get('chapterName', f'Episode {ep_index + 1}'),
+                        "Video URL": watch_info.get('videoUrl', 'Not Found') if watch_info else 'Error'
+                    })
+                print(f"\n  Done: {len(episodes)} episodes added.")
+            
+            page += 1
+        
+        if all_data_list:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_filename = f"dramabox_all_urls_{timestamp}.xlsx"
+            print(f"\nSaving {len(all_data_list)} total rows to Excel...")
+            df = pd.DataFrame(all_data_list)
+            df.to_excel(export_filename, index=False)
+            print(f"Global export complete: {export_filename}")
+        else:
+            print("No data found to export.")
+
 def main():
     scraper = DramaboxScraper()
     
@@ -289,9 +397,10 @@ def main():
         print("3. Download 1 Specific Episode")
         print("4. Check Update (Download only new items)")
         print("5. Sync Folders to Excel & Refresh History")
-        print("6. Exit")
+        print("6. Export ALL Dramas + Video URLs (Loop all pages)")
+        print("7. Exit")
         
-        choice = input("Enter choice (1-6): ")
+        choice = input("Enter choice (1-7): ")
         
         if choice == '1':
             scraper.download_all()
@@ -308,6 +417,8 @@ def main():
         elif choice == '5':
             scraper.sync_local_folders()
         elif choice == '6':
+            scraper.export_all_dramas_to_excel_with_urls()
+        elif choice == '7':
             break
         else:
             print("Invalid choice.")
